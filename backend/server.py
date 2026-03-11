@@ -1,5 +1,5 @@
 from fastapi import FastAPI, APIRouter, HTTPException, File, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -9,19 +9,19 @@ from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Optional
 import uuid
-from datetime import datetime, timezone, timedelta
-import face_recognition
+from datetime import datetime, timezone
+import cv2
 import numpy as np
 import base64
 import io
 from PIL import Image
-from reportlab.lib.pagesizes import letter, A4
+from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.units import inch
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
-import tempfile
+from scipy.spatial.distance import cosine
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -44,6 +44,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Initialize face detector
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
 # ==================== MODELS ====================
 
@@ -53,7 +55,7 @@ class Employee(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     employee_id: str
     name: str
-    face_encodings: List[str] = []  # Base64 encoded face encodings
+    face_encodings: List[str] = []  # Base64 encoded face feature vectors
     enrolled_date: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -72,44 +74,114 @@ class Attendance(BaseModel):
     in_time: Optional[datetime] = None
     out_time: Optional[datetime] = None
     working_hours: Optional[float] = None
-    status: str = "present"  # present, absent, incomplete
+    status: str = "present"
 
 
 class FaceRecognitionRequest(BaseModel):
     image: str  # Base64 encoded image
 
 
-class AttendanceReport(BaseModel):
-    start_date: Optional[str] = None
-    end_date: Optional[str] = None
-    employee_id: Optional[str] = None
-
-
 # ==================== UTILITY FUNCTIONS ====================
 
-def encode_face_to_base64(face_encoding: np.ndarray) -> str:
-    """Convert numpy face encoding to base64 string"""
-    return base64.b64encode(face_encoding.tobytes()).decode('utf-8')
+def encode_vector_to_base64(vector: np.ndarray) -> str:
+    """Convert numpy vector to base64 string"""
+    return base64.b64encode(vector.tobytes()).decode('utf-8')
 
 
-def decode_face_from_base64(encoded_str: str) -> np.ndarray:
-    """Convert base64 string back to numpy face encoding"""
-    return np.frombuffer(base64.b64decode(encoded_str), dtype=np.float64)
+def decode_vector_from_base64(encoded_str: str) -> np.ndarray:
+    """Convert base64 string back to numpy vector"""
+    return np.frombuffer(base64.b64decode(encoded_str), dtype=np.float32)
 
 
 def decode_image_from_base64(image_str: str) -> np.ndarray:
     """Decode base64 image string to numpy array"""
     try:
-        # Remove data URL prefix if present
         if ',' in image_str:
             image_str = image_str.split(',')[1]
         
         image_bytes = base64.b64decode(image_str)
         image = Image.open(io.BytesIO(image_bytes))
-        return np.array(image)
+        return cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
     except Exception as e:
         logger.error(f"Error decoding image: {e}")
         raise HTTPException(status_code=400, detail="Invalid image format")
+
+
+def detect_faces(image: np.ndarray) -> List:
+    """Detect faces in image using Haar Cascade"""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(
+        gray,
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=(50, 50)
+    )
+    return faces
+
+
+def extract_face_features(image: np.ndarray, face_rect) -> np.ndarray:
+    """Extract face features using histogram of gradients and color features"""
+    x, y, w, h = face_rect
+    
+    # Extract face region with some padding
+    padding = 10
+    y1 = max(0, y - padding)
+    y2 = min(image.shape[0], y + h + padding)
+    x1 = max(0, x - padding)
+    x2 = min(image.shape[1], x + w + padding)
+    
+    face_img = image[y1:y2, x1:x2]
+    
+    # Resize to standard size
+    face_resized = cv2.resize(face_img, (128, 128))
+    
+    # Convert to grayscale for HOG features
+    gray_face = cv2.cvtColor(face_resized, cv2.COLOR_BGR2GRAY)
+    
+    # Calculate HOG features
+    win_size = (128, 128)
+    block_size = (16, 16)
+    block_stride = (8, 8)
+    cell_size = (8, 8)
+    nbins = 9
+    
+    hog = cv2.HOGDescriptor(win_size, block_size, block_stride, cell_size, nbins)
+    hog_features = hog.compute(gray_face)
+    
+    # Calculate color histogram features
+    hist_b = cv2.calcHist([face_resized], [0], None, [32], [0, 256])
+    hist_g = cv2.calcHist([face_resized], [1], None, [32], [0, 256])
+    hist_r = cv2.calcHist([face_resized], [2], None, [32], [0, 256])
+    
+    # Normalize histograms
+    hist_b = cv2.normalize(hist_b, hist_b).flatten()
+    hist_g = cv2.normalize(hist_g, hist_g).flatten()
+    hist_r = cv2.normalize(hist_r, hist_r).flatten()
+    
+    # Combine features
+    color_features = np.concatenate([hist_b, hist_g, hist_r])
+    
+    # Combine HOG and color features
+    features = np.concatenate([hog_features.flatten(), color_features])
+    
+    # Normalize final feature vector
+    features = features / np.linalg.norm(features)
+    
+    return features.astype(np.float32)
+
+
+def compare_face_features(known_features_list: List[np.ndarray], test_features: np.ndarray, threshold=0.35) -> bool:
+    """Compare face features using cosine similarity"""
+    if not known_features_list:
+        return False
+    
+    similarities = []
+    for known_features in known_features_list:
+        similarity = 1 - cosine(known_features, test_features)
+        similarities.append(similarity)
+    
+    max_similarity = max(similarities)
+    return max_similarity > (1 - threshold)
 
 
 def calculate_working_hours(in_time: datetime, out_time: datetime) -> float:
@@ -120,15 +192,6 @@ def calculate_working_hours(in_time: datetime, out_time: datetime) -> float:
     duration = out_time - in_time
     hours = duration.total_seconds() / 3600
     return round(hours, 2)
-
-
-def compare_faces_with_encodings(known_encodings: List[np.ndarray], face_encoding: np.ndarray, tolerance=0.6) -> bool:
-    """Compare a face encoding with multiple known encodings"""
-    if not known_encodings:
-        return False
-    
-    matches = face_recognition.compare_faces(known_encodings, face_encoding, tolerance=tolerance)
-    return any(matches)
 
 
 # ==================== EMPLOYEE ENDPOINTS ====================
@@ -146,37 +209,39 @@ async def enroll_employee(
         if existing:
             raise HTTPException(status_code=400, detail="Employee ID already exists")
         
-        face_encodings = []
+        face_features = []
         
         # Process each uploaded image
         for image_file in images:
             image_bytes = await image_file.read()
             image = Image.open(io.BytesIO(image_bytes))
-            image_np = np.array(image)
+            image_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
             
-            # Detect and encode faces
-            face_locations = face_recognition.face_locations(image_np, model="hog")
+            # Detect faces
+            faces = detect_faces(image_cv)
             
-            if not face_locations:
+            if len(faces) == 0:
                 logger.warning(f"No face detected in one of the images for {employee_id}")
                 continue
             
-            # Get face encoding for the first detected face
-            encodings = face_recognition.face_encodings(image_np, face_locations)
-            if encodings:
-                face_encodings.append(encode_face_to_base64(encodings[0]))
+            # Extract features from the first (largest) detected face
+            if len(faces) > 0:
+                # Get the largest face
+                largest_face = max(faces, key=lambda f: f[2] * f[3])
+                features = extract_face_features(image_cv, largest_face)
+                face_features.append(encode_vector_to_base64(features))
         
-        if len(face_encodings) < 3:
+        if len(face_features) < 3:
             raise HTTPException(
                 status_code=400, 
-                detail=f"Need at least 3 clear face images. Only {len(face_encodings)} valid faces detected."
+                detail=f"Need at least 3 clear face images. Only {len(face_features)} valid faces detected."
             )
         
         # Create employee record
         employee = Employee(
             employee_id=employee_id,
             name=name,
-            face_encodings=face_encodings
+            face_encodings=face_features
         )
         
         doc = employee.model_dump()
@@ -184,7 +249,7 @@ async def enroll_employee(
         
         await db.employees.insert_one(doc)
         
-        logger.info(f"Employee {name} (ID: {employee_id}) enrolled with {len(face_encodings)} face encodings")
+        logger.info(f"Employee {name} (ID: {employee_id}) enrolled with {len(face_features)} face encodings")
         
         return employee
         
@@ -240,27 +305,20 @@ async def recognize_and_mark_attendance(request: FaceRecognitionRequest):
     """Recognize face from image and mark attendance"""
     try:
         # Decode image
-        image_np = decode_image_from_base64(request.image)
+        image_cv = decode_image_from_base64(request.image)
         
-        # Detect faces in the image
-        face_locations = face_recognition.face_locations(image_np, model="hog")
+        # Detect faces
+        faces = detect_faces(image_cv)
         
-        if not face_locations:
+        if len(faces) == 0:
             return {
                 "recognized": False,
                 "message": "No face detected in the image"
             }
         
-        # Get face encodings
-        face_encodings = face_recognition.face_encodings(image_np, face_locations)
-        
-        if not face_encodings:
-            return {
-                "recognized": False,
-                "message": "Could not encode the detected face"
-            }
-        
-        detected_encoding = face_encodings[0]
+        # Extract features from the first detected face
+        largest_face = max(faces, key=lambda f: f[2] * f[3])
+        test_features = extract_face_features(image_cv, largest_face)
         
         # Get all employees
         employees = await db.employees.find({}, {"_id": 0}).to_list(1000)
@@ -269,9 +327,9 @@ async def recognize_and_mark_attendance(request: FaceRecognitionRequest):
         matched_employee = None
         
         for employee in employees:
-            known_encodings = [decode_face_from_base64(enc) for enc in employee['face_encodings']]
+            known_features_list = [decode_vector_from_base64(enc) for enc in employee['face_encodings']]
             
-            if compare_faces_with_encodings(known_encodings, detected_encoding, tolerance=0.5):
+            if compare_face_features(known_features_list, test_features, threshold=0.35):
                 matched_employee = employee
                 break
         
@@ -473,15 +531,6 @@ async def download_attendance_report_pdf(
             textColor=colors.HexColor('#1a56db'),
             spaceAfter=30,
             alignment=TA_CENTER
-        )
-        
-        heading_style = ParagraphStyle(
-            'CustomHeading',
-            parent=styles['Heading2'],
-            fontSize=14,
-            textColor=colors.HexColor('#374151'),
-            spaceAfter=12,
-            alignment=TA_LEFT
         )
         
         # Title
