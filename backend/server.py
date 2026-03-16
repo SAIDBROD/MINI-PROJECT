@@ -21,7 +21,6 @@ from reportlab.lib.units import inch
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
-from scipy.spatial.distance import cosine
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -44,8 +43,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Initialize face detector
+# Initialize face detector (Haar Cascade)
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+# Initialize LBPH Face Recognizer
+face_recognizer = cv2.face.LBPHFaceRecognizer_create(radius=2, neighbors=8, grid_x=8, grid_y=8)
+
 
 # ==================== MODELS ====================
 
@@ -55,7 +58,7 @@ class Employee(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     employee_id: str
     name: str
-    face_encodings: List[str] = []  # Base64 encoded face feature vectors
+    face_encodings: List[str] = []  # Base64 encoded face images
     enrolled_date: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -83,105 +86,54 @@ class FaceRecognitionRequest(BaseModel):
 
 # ==================== UTILITY FUNCTIONS ====================
 
-def encode_vector_to_base64(vector: np.ndarray) -> str:
-    """Convert numpy vector to base64 string"""
-    return base64.b64encode(vector.tobytes()).decode('utf-8')
+def encode_face_image_to_base64(face_img: np.ndarray) -> str:
+    """Convert face image to base64 string"""
+    _, buffer = cv2.imencode('.jpg', face_img)
+    return base64.b64encode(buffer).decode('utf-8')
 
 
-def decode_vector_from_base64(encoded_str: str) -> np.ndarray:
-    """Convert base64 string back to numpy vector"""
-    return np.frombuffer(base64.b64decode(encoded_str), dtype=np.float32)
+def decode_face_image_from_base64(encoded_str: str) -> np.ndarray:
+    """Convert base64 string back to face image"""
+    img_bytes = base64.b64decode(encoded_str)
+    nparr = np.frombuffer(img_bytes, np.uint8)
+    return cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
 
 
 def decode_image_from_base64(image_str: str) -> np.ndarray:
     """Decode base64 image string to numpy array"""
     try:
+        # Remove data URL prefix if present
         if ',' in image_str:
             image_str = image_str.split(',')[1]
         
         image_bytes = base64.b64decode(image_str)
         image = Image.open(io.BytesIO(image_bytes))
-        return cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+        image_np = np.array(image)
+        
+        # Convert to BGR if needed (OpenCV uses BGR)
+        if len(image_np.shape) == 3 and image_np.shape[2] == 3:
+            image_np = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+        
+        return image_np
     except Exception as e:
         logger.error(f"Error decoding image: {e}")
         raise HTTPException(status_code=400, detail="Invalid image format")
 
 
 def detect_faces(image: np.ndarray) -> List:
-    """Detect faces in image using Haar Cascade"""
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(
-        gray,
-        scaleFactor=1.1,
-        minNeighbors=5,
-        minSize=(50, 50)
-    )
+    """Detect faces in an image"""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(100, 100))
     return faces
 
 
-def extract_face_features(image: np.ndarray, face_rect) -> np.ndarray:
-    """Extract face features using histogram of gradients and color features"""
+def extract_face(image: np.ndarray, face_rect) -> np.ndarray:
+    """Extract and normalize face from image"""
     x, y, w, h = face_rect
-    
-    # Extract face region with some padding
-    padding = 10
-    y1 = max(0, y - padding)
-    y2 = min(image.shape[0], y + h + padding)
-    x1 = max(0, x - padding)
-    x2 = min(image.shape[1], x + w + padding)
-    
-    face_img = image[y1:y2, x1:x2]
-    
-    # Resize to standard size
-    face_resized = cv2.resize(face_img, (128, 128))
-    
-    # Convert to grayscale for HOG features
-    gray_face = cv2.cvtColor(face_resized, cv2.COLOR_BGR2GRAY)
-    
-    # Calculate HOG features
-    win_size = (128, 128)
-    block_size = (16, 16)
-    block_stride = (8, 8)
-    cell_size = (8, 8)
-    nbins = 9
-    
-    hog = cv2.HOGDescriptor(win_size, block_size, block_stride, cell_size, nbins)
-    hog_features = hog.compute(gray_face)
-    
-    # Calculate color histogram features
-    hist_b = cv2.calcHist([face_resized], [0], None, [32], [0, 256])
-    hist_g = cv2.calcHist([face_resized], [1], None, [32], [0, 256])
-    hist_r = cv2.calcHist([face_resized], [2], None, [32], [0, 256])
-    
-    # Normalize histograms
-    hist_b = cv2.normalize(hist_b, hist_b).flatten()
-    hist_g = cv2.normalize(hist_g, hist_g).flatten()
-    hist_r = cv2.normalize(hist_r, hist_r).flatten()
-    
-    # Combine features
-    color_features = np.concatenate([hist_b, hist_g, hist_r])
-    
-    # Combine HOG and color features
-    features = np.concatenate([hog_features.flatten(), color_features])
-    
-    # Normalize final feature vector
-    features = features / np.linalg.norm(features)
-    
-    return features.astype(np.float32)
-
-
-def compare_face_features(known_features_list: List[np.ndarray], test_features: np.ndarray, threshold=0.35) -> bool:
-    """Compare face features using cosine similarity"""
-    if not known_features_list:
-        return False
-    
-    similarities = []
-    for known_features in known_features_list:
-        similarity = 1 - cosine(known_features, test_features)
-        similarities.append(similarity)
-    
-    max_similarity = max(similarities)
-    return max_similarity > (1 - threshold)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+    face = gray[y:y+h, x:x+w]
+    face = cv2.resize(face, (200, 200))  # Normalize size
+    return face
 
 
 def calculate_working_hours(in_time: datetime, out_time: datetime) -> float:
@@ -192,6 +144,94 @@ def calculate_working_hours(in_time: datetime, out_time: datetime) -> float:
     duration = out_time - in_time
     hours = duration.total_seconds() / 3600
     return round(hours, 2)
+
+
+async def train_recognizer_for_employee(employee_data: dict) -> bool:
+    """Train the face recognizer with employee's faces"""
+    try:
+        if not employee_data.get('face_encodings'):
+            return False
+        
+        faces = []
+        labels = []
+        
+        # Get label (using hash of employee_id for consistent labeling)
+        label = abs(hash(employee_data['employee_id'])) % (10 ** 8)
+        
+        for encoded_face in employee_data['face_encodings']:
+            face_img = decode_face_image_from_base64(encoded_face)
+            faces.append(face_img)
+            labels.append(label)
+        
+        if faces:
+            # Get all employees to train complete model
+            all_employees = await db.employees.find({}, {"_id": 0}).to_list(1000)
+            
+            all_faces = []
+            all_labels = []
+            
+            for emp in all_employees:
+                emp_label = abs(hash(emp['employee_id'])) % (10 ** 8)
+                for enc in emp.get('face_encodings', []):
+                    face_img = decode_face_image_from_base64(enc)
+                    all_faces.append(face_img)
+                    all_labels.append(emp_label)
+            
+            if all_faces:
+                face_recognizer.train(all_faces, np.array(all_labels))
+                logger.info(f"Trained recognizer with {len(all_faces)} faces from {len(all_employees)} employees")
+                return True
+        
+        return False
+    except Exception as e:
+        logger.error(f"Error training recognizer: {e}")
+        return False
+
+
+async def recognize_face(face_img: np.ndarray) -> Optional[dict]:
+    """Recognize a face and return employee data"""
+    try:
+        all_employees = await db.employees.find({}, {"_id": 0}).to_list(1000)
+        
+        if not all_employees:
+            return None
+        
+        best_match = None
+        best_confidence = float('inf')
+        
+        # Try matching with each employee
+        for employee in all_employees:
+            if not employee.get('face_encodings'):
+                continue
+            
+            emp_label = abs(hash(employee['employee_id'])) % (10 ** 8)
+            
+            for encoded_face in employee['face_encodings']:
+                stored_face = decode_face_image_from_base64(encoded_face)
+                
+                # Compare using multiple methods for better accuracy
+                # Method 1: Template Matching
+                result = cv2.matchTemplate(face_img, stored_face, cv2.TM_CCOEFF_NORMED)
+                _, max_val, _, _ = cv2.minMaxLoc(result)
+                
+                # Method 2: Histogram comparison
+                hist1 = cv2.calcHist([face_img], [0], None, [256], [0, 256])
+                hist2 = cv2.calcHist([stored_face], [0], None, [256], [0, 256])
+                hist_score = cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
+                
+                # Combined score (weighted average)
+                combined_score = (max_val * 0.6) + (hist_score * 0.4)
+                confidence = 1 - combined_score  # Lower is better
+                
+                if confidence < best_confidence and combined_score > 0.55:  # Threshold
+                    best_confidence = confidence
+                    best_match = employee
+        
+        return best_match if best_match else None
+        
+    except Exception as e:
+        logger.error(f"Error recognizing face: {e}")
+        return None
 
 
 # ==================== EMPLOYEE ENDPOINTS ====================
@@ -209,39 +249,40 @@ async def enroll_employee(
         if existing:
             raise HTTPException(status_code=400, detail="Employee ID already exists")
         
-        face_features = []
+        face_encodings = []
         
         # Process each uploaded image
         for image_file in images:
             image_bytes = await image_file.read()
             image = Image.open(io.BytesIO(image_bytes))
-            image_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+            image_np = np.array(image)
+            
+            # Convert RGB to BGR for OpenCV
+            if len(image_np.shape) == 3:
+                image_np = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
             
             # Detect faces
-            faces = detect_faces(image_cv)
+            faces = detect_faces(image_np)
             
             if len(faces) == 0:
                 logger.warning(f"No face detected in one of the images for {employee_id}")
                 continue
             
-            # Extract features from the first (largest) detected face
-            if len(faces) > 0:
-                # Get the largest face
-                largest_face = max(faces, key=lambda f: f[2] * f[3])
-                features = extract_face_features(image_cv, largest_face)
-                face_features.append(encode_vector_to_base64(features))
+            # Extract first face
+            face_img = extract_face(image_np, faces[0])
+            face_encodings.append(encode_face_image_to_base64(face_img))
         
-        if len(face_features) < 3:
+        if len(face_encodings) < 3:
             raise HTTPException(
                 status_code=400, 
-                detail=f"Need at least 3 clear face images. Only {len(face_features)} valid faces detected."
+                detail=f"Need at least 3 clear face images. Only {len(face_encodings)} valid faces detected."
             )
         
         # Create employee record
         employee = Employee(
             employee_id=employee_id,
             name=name,
-            face_encodings=face_features
+            face_encodings=face_encodings
         )
         
         doc = employee.model_dump()
@@ -249,7 +290,10 @@ async def enroll_employee(
         
         await db.employees.insert_one(doc)
         
-        logger.info(f"Employee {name} (ID: {employee_id}) enrolled with {len(face_features)} face encodings")
+        # Train recognizer with new employee
+        await train_recognizer_for_employee(doc)
+        
+        logger.info(f"Employee {name} (ID: {employee_id}) enrolled with {len(face_encodings)} face images")
         
         return employee
         
@@ -285,6 +329,11 @@ async def delete_employee(employee_id: str):
         if result.deleted_count == 0:
             raise HTTPException(status_code=404, detail="Employee not found")
         
+        # Retrain recognizer without this employee
+        all_employees = await db.employees.find({}, {"_id": 0}).to_list(1000)
+        if all_employees:
+            await train_recognizer_for_employee(all_employees[0])
+        
         # Also delete attendance records
         await db.attendance.delete_many({"employee_id": employee_id})
         
@@ -305,10 +354,10 @@ async def recognize_and_mark_attendance(request: FaceRecognitionRequest):
     """Recognize face from image and mark attendance"""
     try:
         # Decode image
-        image_cv = decode_image_from_base64(request.image)
+        image_np = decode_image_from_base64(request.image)
         
         # Detect faces
-        faces = detect_faces(image_cv)
+        faces = detect_faces(image_np)
         
         if len(faces) == 0:
             return {
@@ -316,22 +365,11 @@ async def recognize_and_mark_attendance(request: FaceRecognitionRequest):
                 "message": "No face detected in the image"
             }
         
-        # Extract features from the first detected face
-        largest_face = max(faces, key=lambda f: f[2] * f[3])
-        test_features = extract_face_features(image_cv, largest_face)
+        # Extract first face
+        face_img = extract_face(image_np, faces[0])
         
-        # Get all employees
-        employees = await db.employees.find({}, {"_id": 0}).to_list(1000)
-        
-        # Try to match with known employees
-        matched_employee = None
-        
-        for employee in employees:
-            known_features_list = [decode_vector_from_base64(enc) for enc in employee['face_encodings']]
-            
-            if compare_face_features(known_features_list, test_features, threshold=0.35):
-                matched_employee = employee
-                break
+        # Recognize face
+        matched_employee = await recognize_face(face_img)
         
         if not matched_employee:
             return {
