@@ -254,12 +254,26 @@ async def enroll_employee(
         # Process each uploaded image
         for image_file in images:
             image_bytes = await image_file.read()
-            image = Image.open(io.BytesIO(image_bytes))
-            image_np = np.array(image)
             
-            # Convert RGB to BGR for OpenCV
-            if len(image_np.shape) == 3:
-                image_np = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+            # Try to decode image
+            try:
+                # Method 1: Try with PIL
+                image = Image.open(io.BytesIO(image_bytes))
+                image_np = np.array(image)
+            except Exception as pil_error:
+                logger.warning(f"PIL failed: {pil_error}, trying OpenCV")
+                # Method 2: Try with OpenCV directly
+                nparr = np.frombuffer(image_bytes, np.uint8)
+                image_np = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                if image_np is None:
+                    logger.error(f"Could not decode image")
+                    continue
+            
+            # Convert RGB to BGR for OpenCV if needed
+            if len(image_np.shape) == 3 and image_np.shape[2] == 3:
+                # Check if it's RGB (from PIL) and convert to BGR
+                if image_np.dtype == np.uint8:
+                    image_np = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
             
             # Detect faces
             faces = detect_faces(image_np)
