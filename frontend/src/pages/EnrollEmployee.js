@@ -218,8 +218,10 @@ const EnrollEmployee = () => {
                       ref={videoRef}
                       autoPlay
                       playsInline
+                      muted
                       className="w-full"
                       data-testid="webcam-video"
+                      style={{ minHeight: '400px' }}
                     />
                   </div>
                   <Button
