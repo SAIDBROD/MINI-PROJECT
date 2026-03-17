@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import axios from 'axios';
 import { Camera, Upload, CheckCircle, X } from 'lucide-react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../components/ui/card';
@@ -20,6 +20,17 @@ const EnrollEmployee = () => {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const { toast } = useToast();
+
+  // Effect to handle video playback when stream changes
+  useEffect(() => {
+    if (stream && videoRef.current) {
+      console.log("🔄 Stream changed, updating video element");
+      videoRef.current.srcObject = stream;
+      videoRef.current.play()
+        .then(() => console.log("✅ Video playing from useEffect"))
+        .catch(err => console.error("❌ Play error from useEffect:", err));
+    }
+  }, [stream]);
 
   const startCamera = async () => {
     try {
