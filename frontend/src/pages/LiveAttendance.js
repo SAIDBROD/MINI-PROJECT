@@ -161,8 +161,10 @@ const LiveAttendance = () => {
                     ref={videoRef}
                     autoPlay
                     playsInline
+                    muted
                     className="w-full"
                     data-testid="attendance-webcam-video"
+                    style={{ minHeight: '400px' }}
                   />
                   <div className="absolute top-0 left-0 right-0 bottom-0 border-4 border-blue-500 pointer-events-none opacity-50"></div>
                 </div>
