@@ -20,17 +20,33 @@ const LiveAttendance = () => {
   const startCamera = async () => {
     try {
       const mediaStream = await navigator.mediaDevices.getUserMedia({
-        video: { width: 640, height: 480 }
+        video: { 
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          facingMode: "user"
+        }
       });
       if (videoRef.current) {
         videoRef.current.srcObject = mediaStream;
+        // Force video to play
+        try {
+          await videoRef.current.play();
+        } catch (playError) {
+          console.log("Video play error:", playError);
+        }
       }
       setStream(mediaStream);
       setIsCapturing(true);
+      
+      toast({
+        title: "Camera Started",
+        description: "Camera is active. Click 'Recognize & Mark Attendance' when ready."
+      });
     } catch (error) {
+      console.error("Camera error:", error);
       toast({
         title: "Camera Error",
-        description: "Unable to access camera. Please check permissions.",
+        description: `Unable to access camera: ${error.message}. Please check permissions.`,
         variant: "destructive"
       });
     }
