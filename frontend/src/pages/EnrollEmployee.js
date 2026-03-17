@@ -23,6 +23,8 @@ const EnrollEmployee = () => {
 
   const startCamera = async () => {
     try {
+      console.log("🎥 Starting camera...");
+      
       const mediaStream = await navigator.mediaDevices.getUserMedia({
         video: { 
           width: { ideal: 1280 },
@@ -30,27 +32,39 @@ const EnrollEmployee = () => {
           facingMode: "user"
         }
       });
+      
+      console.log("✅ Got media stream:", mediaStream);
+      console.log("📹 Video tracks:", mediaStream.getVideoTracks());
+      
       if (videoRef.current) {
+        console.log("📺 Video element exists:", videoRef.current);
+        
         videoRef.current.srcObject = mediaStream;
-        // Force video to play
-        try {
-          await videoRef.current.play();
-        } catch (playError) {
-          console.log("Video play error:", playError);
-        }
+        console.log("✅ Set srcObject");
+        
+        // Wait for video to load metadata
+        videoRef.current.onloadedmetadata = () => {
+          console.log("📊 Video metadata loaded");
+          videoRef.current.play()
+            .then(() => console.log("▶️ Video playing"))
+            .catch(err => console.error("❌ Play error:", err));
+        };
+      } else {
+        console.error("❌ Video ref is null!");
       }
+      
       setStream(mediaStream);
       setIsCapturing(true);
       
       toast({
         title: "Camera Started",
-        description: "Camera is now active. Position your face in the frame."
+        description: "Camera is now active. Check console for debug info."
       });
     } catch (error) {
-      console.error("Camera error:", error);
+      console.error("❌ Camera error:", error);
       toast({
         title: "Camera Error",
-        description: `Unable to access camera: ${error.message}. Please check permissions.`,
+        description: `Unable to access camera: ${error.message}`,
         variant: "destructive"
       });
     }
