@@ -251,40 +251,45 @@ async def enroll_employee(
         
         face_encodings = []
         
+        logger.info(f"Processing enrollment for {employee_id} - {name}")
+        logger.info(f"Received {len(images)} images")
+        
         # Process each uploaded image
-        for image_file in images:
-            image_bytes = await image_file.read()
-            
-            # Try to decode image
+        for idx, image_file in enumerate(images):
             try:
-                # Method 1: Try with PIL
-                image = Image.open(io.BytesIO(image_bytes))
-                image_np = np.array(image)
-            except Exception as pil_error:
-                logger.warning(f"PIL failed: {pil_error}, trying OpenCV")
-                # Method 2: Try with OpenCV directly
+                logger.info(f"Processing image {idx+1}: {image_file.filename}, content_type: {image_file.content_type}")
+                
+                image_bytes = await image_file.read()
+                logger.info(f"Image {idx+1} size: {len(image_bytes)} bytes")
+                
+                # Decode image using OpenCV (more reliable for web images)
                 nparr = np.frombuffer(image_bytes, np.uint8)
                 image_np = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                
                 if image_np is None:
-                    logger.error(f"Could not decode image")
+                    logger.error(f"Failed to decode image {idx+1}")
                     continue
-            
-            # Convert RGB to BGR for OpenCV if needed
-            if len(image_np.shape) == 3 and image_np.shape[2] == 3:
-                # Check if it's RGB (from PIL) and convert to BGR
-                if image_np.dtype == np.uint8:
-                    image_np = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
-            
-            # Detect faces
-            faces = detect_faces(image_np)
-            
-            if len(faces) == 0:
-                logger.warning(f"No face detected in one of the images for {employee_id}")
+                
+                logger.info(f"Image {idx+1} decoded: shape {image_np.shape}")
+                
+                # Detect faces
+                faces = detect_faces(image_np)
+                logger.info(f"Detected {len(faces)} faces in image {idx+1}")
+                
+                if len(faces) == 0:
+                    logger.warning(f"No face detected in image {idx+1} for {employee_id}")
+                    continue
+                
+                # Extract first face
+                face_img = extract_face(image_np, faces[0])
+                face_encodings.append(encode_face_image_to_base64(face_img))
+                logger.info(f"Successfully extracted face from image {idx+1}")
+                
+            except Exception as img_error:
+                logger.error(f"Error processing image {idx+1}: {img_error}")
                 continue
-            
-            # Extract first face
-            face_img = extract_face(image_np, faces[0])
-            face_encodings.append(encode_face_image_to_base64(face_img))
+        
+        logger.info(f"Total valid faces extracted: {len(face_encodings)}")
         
         if len(face_encodings) < 3:
             raise HTTPException(
