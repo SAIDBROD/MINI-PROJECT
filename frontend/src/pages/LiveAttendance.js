@@ -13,6 +13,7 @@ const LiveAttendance = () => {
   const [stream, setStream] = useState(null);
   const [processing, setProcessing] = useState(false);
   const [lastRecognition, setLastRecognition] = useState(null);
+  const [totalTime, setTotalTime] = useState(0);
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const { toast } = useToast();
@@ -26,16 +27,18 @@ const LiveAttendance = () => {
           facingMode: "user"
         }
       });
-      if (videoRef.current) {
-        videoRef.current.srcObject = mediaStream;
-        // Force video to play
-        try {
-          await videoRef.current.play();
-        } catch (playError) {
-          console.log("Video play error:", playError);
-        }
-      }
       setStream(mediaStream);
+      setTimeout(() => {
+        if (videoRef.current) {
+        videoRef.current.srcObject = mediaStream;
+
+        videoRef.current.onloadedmetadata = () => {
+          videoRef.current.play();
+        };
+        }
+      }, 200);
+        
+      
       setIsCapturing(true);
       
       toast({
@@ -65,6 +68,18 @@ const LiveAttendance = () => {
       stopCamera();
     };
   }, []);
+  useEffect(() => {
+  let interval;
+
+  if (isCapturing) {
+    interval = setInterval(() => {
+  recognizeAndMark();
+  fetchTotalTime();   // 🔥 ADD THIS
+}, 3000);
+  }
+
+  return () => clearInterval(interval);
+}, [isCapturing]);
 
   const recognizeAndMark = async () => {
     if (!videoRef.current || !canvasRef.current) return;
@@ -80,38 +95,25 @@ const LiveAttendance = () => {
       ctx.drawImage(video, 0, 0);
       const imageDataUrl = canvas.toDataURL('image/jpeg');
 
-      const response = await axios.post(`${API}/attendance/recognize`, {
+      const response = await axios.post(`${API}/attendance/auto`, {
         image: imageDataUrl
       });
 
+
       const result = response.data;
 
-      if (result.recognized) {
-        setLastRecognition(result);
-        
-        if (result.action === 'in') {
-          toast({
-            title: "✅ In-Time Marked",
-            description: result.message,
-            className: "bg-green-50 border-green-200"
-          });
-        } else if (result.action === 'out') {
-          toast({
-            title: "✅ Out-Time Marked",
-            description: `${result.message} Working hours: ${result.working_hours}`,
-            className: "bg-blue-50 border-blue-200"
-          });
-        } else {
-          toast({
-            title: "ℹ️ Already Marked",
-            description: result.message,
-            className: "bg-yellow-50 border-yellow-200"
-          });
-        }
-      } else {
+if (result.recognized) {
+  setLastRecognition({
+    employee_name: "Face Detected",
+    employee_id: "-",
+    action: "present",
+    time: new Date()
+  });
+} 
+      else {
         toast({
           title: "❌ Not Recognized",
-          description: result.message,
+          description: "Face not recognized",
           variant: "destructive"
         });
       }
@@ -126,11 +128,23 @@ const LiveAttendance = () => {
       setProcessing(false);
     }
   };
+ const fetchTotalTime = async () => {
+  try {
+    const res = await axios.get(`${API}/attendance/total/101`);
+    setTotalTime(res.data.total_hours);
+  } catch (err) {
+    console.log(err);
+  }
+};
+  
 
   return (
     <div className="max-w-4xl mx-auto space-y-6" data-testid="live-attendance-page">
       <div>
         <h1 className="text-3xl font-bold text-gray-900">Mark Attendance</h1>
+        <h2 className="text-xl text-blue-600 mt-2">
+  Total Working Time: {totalTime} hrs
+</h2>
         <p className="text-gray-600 mt-2">Use face recognition to mark attendance</p>
       </div>
 
@@ -162,9 +176,7 @@ const LiveAttendance = () => {
                     autoPlay
                     playsInline
                     muted
-                    className="w-full"
-                    data-testid="attendance-webcam-video"
-                    style={{ minHeight: '400px' }}
+                    className="w-full h-[400px] object-cover"
                   />
                   <div className="absolute top-0 left-0 right-0 bottom-0 border-4 border-blue-500 pointer-events-none opacity-50"></div>
                 </div>

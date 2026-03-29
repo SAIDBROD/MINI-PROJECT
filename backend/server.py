@@ -21,7 +21,8 @@ from reportlab.lib.units import inch
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
-
+from datetime import datetime, timedelta
+import base64
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
@@ -223,7 +224,7 @@ async def recognize_face(face_img: np.ndarray) -> Optional[dict]:
                 combined_score = (max_val * 0.6) + (hist_score * 0.4)
                 confidence = 1 - combined_score  # Lower is better
                 
-                if confidence < best_confidence and combined_score > 0.55:  # Threshold
+                if confidence < best_confidence and combined_score > 0.35:  # Threshold
                     best_confidence = confidence
                     best_match = employee
         
@@ -367,7 +368,16 @@ async def delete_employee(employee_id: str):
 
 
 # ==================== ATTENDANCE ENDPOINTS ====================
+def calculate_total_time(sessions):
+    total_seconds = 0
 
+    for s in sessions:
+        if s.get("start") and s.get("end"):
+            start = datetime.fromisoformat(s["start"])
+            end = datetime.fromisoformat(s["end"])
+            total_seconds += (end - start).total_seconds()
+
+    return round(total_seconds / 3600, 2)
 @api_router.post("/attendance/recognize")
 async def recognize_and_mark_attendance(request: FaceRecognitionRequest):
     """Recognize face from image and mark attendance"""
@@ -717,6 +727,102 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
+@app.get("/api/attendance/total/{employee_id}")
+async def get_total_time(employee_id: str):
+    try:
+        today = datetime.now(timezone.utc).date().isoformat()
+
+        record = await db.attendance.find_one({
+            "employee_id": employee_id,
+            "date": today
+        })
+
+        if not record:
+            return {"total_hours": 0}
+
+        sessions = record.get("sessions", [])
+
+        total_seconds = 0
+        for s in sessions:
+            if s.get("start") and s.get("end"):
+                start = datetime.fromisoformat(s["start"])
+                end = datetime.fromisoformat(s["end"])
+                total_seconds += (end - start).total_seconds()
+
+        total_hours = round(total_seconds / 3600, 2)
+
+        return {"total_hours": total_hours}
+
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/api/attendance/auto")
+async def auto_attendance(request: FaceRecognitionRequest):
+    try:
+        image_np = decode_image_from_base64(request.image)
+
+        faces = detect_faces(image_np)
+        if len(faces) == 0:
+            return {"recognized": False}
+
+        face_img = extract_face(image_np, faces[0])
+
+        employee = await recognize_face(face_img)
+        if not employee:
+            return {"recognized": False}
+
+        employee_id = employee["employee_id"]
+        now = datetime.now(timezone.utc)
+        today = now.date().isoformat()
+
+        record = await db.attendance.find_one({
+            "employee_id": employee_id,
+            "date": today
+        })
+
+        if not record:
+            await db.attendance.insert_one({
+                "employee_id": employee_id,
+                "employee_name": employee["name"],
+                "date": today,
+                "sessions": [{
+                    "start": now.isoformat(),
+                    "end": None
+                }],
+                "last_seen": now.isoformat()
+            })
+
+        else:
+            last_seen = record.get("last_seen")
+            last_seen = datetime.fromisoformat(last_seen) if last_seen else now
+
+            gap = now - last_seen
+
+            if gap < timedelta(minutes=2):
+                await db.attendance.update_one(
+                    {"_id": record["_id"]},
+                    {"$set": {"last_seen": now.isoformat()}}
+                )
+            else:
+                sessions = record.get("sessions", [])
+
+                if sessions and sessions[-1]["end"] is None:
+                    sessions[-1]["end"] = last_seen.isoformat()
+
+                sessions.append({
+                    "start": now.isoformat(),
+                    "end": None
+                })
+
+                await db.attendance.update_one(
+                    {"_id": record["_id"]},
+                    {"$set": {
+                        "sessions": sessions,
+                        "last_seen": now.isoformat()
+                    }}
+                )
+
+        return {"recognized": True}
+
+    except Exception as e:
+        return {"error": str(e)}
