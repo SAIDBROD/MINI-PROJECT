@@ -101,13 +101,14 @@ const LiveAttendance = () => {
 
 
       const result = response.data;
+      console.log(result)
+
 
 if (result.recognized) {
   setLastRecognition({
-    employee_name: "Face Detected",
-    employee_id: "-",
-    action: "present",
-    time: new Date()
+    employee_name: result.employee_name,
+employee_id: result.employee_id,
+time: result.time
   });
 } 
       else {

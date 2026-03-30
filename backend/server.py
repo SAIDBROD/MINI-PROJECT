@@ -822,7 +822,12 @@ async def auto_attendance(request: FaceRecognitionRequest):
                     }}
                 )
 
-        return {"recognized": True}
+        return {
+    "recognized": True,
+    "employee_id": employee["employee_id"],
+    "employee_name": employee["name"],
+    "time": now.isoformat()
+}
 
     except Exception as e:
         return {"error": str(e)}
